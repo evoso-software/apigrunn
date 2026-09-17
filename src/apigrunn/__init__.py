@@ -5,14 +5,14 @@
     ...     for talk in client.talks(year=2024, track="healthcare"):
     ...         print(talk.title, talk.url)
 
-The cache stores the crawled HTML of the eight track pages and nothing else;
-talks are parsed out of that HTML when a query asks for them.
+The cache holds the parsed, normalized talks: pages are scraped and parsed at
+refresh time, and queries are plain SQL against the stored rows.
 """
 
 from ._version import __version__
-from .cache import Cache, Page, default_db_path
+from .cache import Cache, PageMeta, default_db_path
 from .client import DEFAULT_TTL, ApiGrunn, AsyncApiGrunn
-from .errors import ApiGrunnError, FetchError, ParseError
+from .errors import ApiGrunnError, CacheVersionError, FetchError, ParseError
 from .models import PageResult, RefreshResult, Talk, Track
 from .parser import ParsedCard, parse_track_page, talks_from_cards
 from .tracks import BASE_URL, TRACKS, track_name, track_url
@@ -25,8 +25,9 @@ __all__ = [
     "ApiGrunnError",
     "AsyncApiGrunn",
     "Cache",
+    "CacheVersionError",
     "FetchError",
-    "Page",
+    "PageMeta",
     "PageResult",
     "ParseError",
     "ParsedCard",

@@ -1,26 +1,19 @@
 [project]
 name = "apigrunn"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python API over the aiGrunn conference website, backed by a local SQLite cache."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ email = "jaap@evoso.nl" }]
 keywords = ["apigrunn", "conference", "talks", "groningen", "scraper"]
-dependencies = [
-    "httpx>=0.27",
-    "beautifulsoup4>=4.12",
-    "pydantic>=2.7",
-]
+dependencies = ["httpx>=0.27", "beautifulsoup4>=4.12", "pydantic>=2.7"]
 
 [project.urls]
 Homepage = "https://www.aigrunn.org/"
 
 [dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [build-system]
 requires = ["hatchling"]

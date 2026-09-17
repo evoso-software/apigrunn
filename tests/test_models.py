@@ -39,7 +39,18 @@ def test_refresh_result_counters() -> None:
             PageResult(track="business", url="u", status="not_modified"),
             PageResult(track="science", url="u", status="error", error="HTTP 503"),
         ],
-        talks_added=66,
+        talks=66,
+        talks_added=4,
+        talks_removed=1,
     )
     assert (result.fetched, result.not_modified) == (1, 1)
     assert [p.track for p in result.errors] == ["science"]
+    assert str(result) == (
+        "RefreshResult(fetched=1, not_modified=1, errors=1, talks=66, added=4, removed=1)"
+    )
+
+
+def test_refresh_result_defaults_to_zero() -> None:
+    result = RefreshResult()
+    assert (result.talks, result.talks_added, result.talks_removed) == (0, 0, 0)
+    assert (result.fetched, result.not_modified, result.errors) == (0, 0, [])

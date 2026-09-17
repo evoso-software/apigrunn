@@ -4,13 +4,9 @@ A small Python API over the [aiGrunn](https://www.aigrunn.org/) conference websi
 backed by a local SQLite cache.
 
 aigrunn.org has no public API and no per-talk pages — the archive of past talks is
-embedded in the HTML of the eight track pages. This library crawls those pages, stores
-their **raw HTML** in SQLite, and parses talks out of it when you query. Refreshes use
-conditional HTTP requests, so an unchanged page costs a single `304`.
-
-Keeping the database to just the crawled HTML means the schema is one table, a parser
-fix takes effect on the next call with no re-crawl, and anything the site publishes that
-isn't modelled yet is already sitting in the cache waiting to be parsed.
+embedded in the HTML of the eight track pages. This library crawls and parses those pages,
+stores the **normalized talks** in SQLite, and answers queries with plain SQL. Refreshes
+use conditional HTTP requests, so an unchanged page costs a single `304`.
 
 ## Install
 
@@ -32,9 +28,7 @@ with ApiGrunn() as client:
 ```
 
 The first call crawls aigrunn.org into the cache; later calls read from SQLite until the
-24-hour TTL expires. Parsing all eight pages takes ~300 ms, so each client memoises the
-result against a digest of the stored HTML — repeated queries re-parse nothing, and the
-memo drops itself the moment a page actually changes.
+24-hour TTL expires. Pages are parsed once, during a refresh — queries never touch HTML.
 
 ### Queries
 
@@ -90,38 +84,57 @@ ApiGrunn(db_path="/tmp/apigrunn.db")     # where to cache
 ApiGrunn(ttl=timedelta(days=7))          # how long before an auto-refresh
 ApiGrunn(auto_refresh=False)             # never hit the network implicitly
 client.refresh()                         # refresh now (conditional requests)
-client.refresh(force=True)               # ignore ETags, re-parse everything
+client.refresh(force=True)               # ignore ETags, re-download and re-parse
 ```
 
 The default location is `$XDG_CACHE_HOME/apigrunn/apigrunn.db` (`~/.cache/apigrunn/apigrunn.db`),
-overridable with `$APIGRUNN_CACHE`. The database is a copy of someone else's website — it
-can be deleted at any time, and a schema change simply rebuilds it.
+overridable with `$APIGRUNN_CACHE`. The database is a copy of someone else's website and
+can be deleted at any time; see [Errors](#errors) for what happens to a cache written by
+an older version.
 
 `refresh()` returns a `RefreshResult` reporting what happened per page:
 
 ```python
 >>> print(client.refresh())
-RefreshResult(fetched=8, not_modified=0, errors=0, talks=66)
+RefreshResult(fetched=8, not_modified=0, errors=0, talks=66, added=66, removed=0)
 ```
 
 ### What's actually stored
 
-One table, one row per track page:
+Normalized talks, plus the HTTP validators that make refreshes conditional:
 
 ```sql
-CREATE TABLE pages (
-    track         TEXT PRIMARY KEY,
+CREATE TABLE talks (
+    video_id      TEXT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    speaker       TEXT NOT NULL DEFAULT '',
     url           TEXT NOT NULL,
-    html          TEXT NOT NULL,
-    etag          TEXT,
-    last_modified TEXT,
-    fetched_at    TEXT NOT NULL
+    year          INTEGER,
+    thumbnail_url TEXT
+);
+
+CREATE TABLE talk_tracks (            -- a talk belongs to 1..n tracks
+    video_id TEXT NOT NULL REFERENCES talks(video_id) ON DELETE CASCADE,
+    track    TEXT NOT NULL,
+    PRIMARY KEY (video_id, track)
+);
+
+CREATE TABLE pages (                  -- one row per source page
+    track TEXT PRIMARY KEY, url TEXT NOT NULL,
+    etag TEXT, last_modified TEXT, fetched_at TEXT NOT NULL
 );
 ```
 
-`client.pages()` hands you that HTML if you want to parse something the API does not
-expose yet. The building blocks are public too, so you can go from HTML to talks without
-a client at all:
+Two consequences worth knowing:
+
+- **A talk removed from aigrunn.org is pruned on the next refresh.** `talk_tracks` is the
+  per-page record of what each page listed, so a talk left on no page is deleted. The
+  cache mirrors the site; it is not an archive of what the site used to say.
+- **The pages themselves are not kept**, so a parser fix does not reach already-cached
+  talks. Run `client.refresh(force=True)` to re-download and re-parse.
+
+The parsing pipeline is public if you want to run it yourself:
 
 ```python
 from apigrunn import parse_track_page, talks_from_cards
@@ -130,9 +143,29 @@ cards = parse_track_page(html, "tech")       # HTML -> one page's cards
 talks = talks_from_cards(cards)              # cards -> deduplicated talks
 ```
 
-Because talks are derived on read, a talk that disappears from aigrunn.org disappears
-from the API on the next refresh. The cache mirrors the site; it is not an archive of
-things the site used to say.
+### Errors
+
+Every exception carries a stable code, prefixed onto its message, so failures are
+greppable without matching on prose:
+
+| Code | Exception | Raised when |
+| --- | --- | --- |
+| `APIGRUNN-E100` | `FetchError` | every track page failed to download |
+| `APIGRUNN-E200` | `ParseError` | a page has talk cards but none could be extracted |
+| `APIGRUNN-E300` | `CacheVersionError` | the cache file is from another schema version |
+
+All inherit from `ApiGrunnError`. Because talks are stored parsed, a cache written by a
+different version of this library cannot be migrated — opening one raises rather than
+silently rebuilding:
+
+```
+[APIGRUNN-E300] ~/.cache/apigrunn/apigrunn.db was written by apigrunn schema
+version 2, but this version requires 3. The cache cannot be migrated: delete
+the file to re-crawl, or pass a different db_path.
+```
+
+`CacheVersionError` carries `.path`, `.found` and `.expected` so a caller can act on it
+without parsing the message.
 
 ## Scope
 

@@ -7,9 +7,10 @@ import httpx
 import pytest
 
 from apigrunn import ApiGrunn, AsyncApiGrunn, FetchError
+from apigrunn.parser import parse_track_page, talks_from_cards
 from apigrunn.tracks import TRACKS
 
-from .conftest import FakeSite
+from .conftest import FakeSite, fixture_html
 
 
 @pytest.fixture
@@ -30,12 +31,8 @@ def test_refresh_stores_every_page(client: ApiGrunn, site: FakeSite) -> None:
     assert result.fetched == 8
     assert result.not_modified == 0
     assert result.errors == []
-    assert result.talks == 66
+    assert (result.talks, result.talks_added, result.talks_removed) == (66, 66, 0)
     assert sorted(site.requests) == sorted(TRACKS)
-    # What landed in the cache is the raw HTML, nothing derived.
-    pages = client.pages()
-    assert sorted(pages) == sorted(TRACKS)
-    assert pages["tech"].lstrip().startswith("<!DOCTYPE html>")
 
 
 def test_second_refresh_is_all_304s(client: ApiGrunn, site: FakeSite) -> None:
@@ -44,7 +41,7 @@ def test_second_refresh_is_all_304s(client: ApiGrunn, site: FakeSite) -> None:
     result = client.refresh()
     assert result.not_modified == 8
     assert result.fetched == 0
-    assert result.talks == 66  # the stored HTML survived the 304s
+    assert (result.talks, result.talks_added, result.talks_removed) == (66, 0, 0)
     assert len(client.talks()) == 66
 
 
@@ -52,8 +49,15 @@ def test_force_refresh_ignores_validators(client: ApiGrunn) -> None:
     client.refresh()
     result = client.refresh(force=True)
     assert result.fetched == 8
-    assert result.talks == 66
+    assert (result.talks, result.talks_added, result.talks_removed) == (66, 0, 0)
     assert len(client.talks()) == 66
+
+
+def test_the_sql_and_pure_merges_agree(client: ApiGrunn) -> None:
+    """Guards against the cache's SQL upsert drifting from talks_from_cards."""
+    client.refresh()
+    cards = [c for t in TRACKS for c in parse_track_page(fixture_html(t), t)]
+    assert client.talks() == talks_from_cards(cards)
 
 
 def test_queries_refresh_on_first_use(client: ApiGrunn, site: FakeSite) -> None:
@@ -128,53 +132,32 @@ def test_unknown_track_is_rejected(client: ApiGrunn) -> None:
         client.talks(track="nope")
 
 
-def test_repeated_queries_parse_the_html_only_once(
-    tmp_path: Path, site: FakeSite, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Parsing all eight pages costs ~300ms, so it must not repeat per query."""
-    import apigrunn.client as client_module
-
-    parses: list[str] = []
-    real = client_module.parse_track_page
-
-    def counting(html: str, track: str):
-        parses.append(track)
-        return real(html, track)
-
-    monkeypatch.setattr(client_module, "parse_track_page", counting)
-
+def test_a_talk_removed_from_the_site_is_pruned(tmp_path: Path, site: FakeSite) -> None:
     with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
         c.refresh()
-        assert sorted(parses) == sorted(TRACKS)  # once each, during the refresh
-        parses.clear()
-
-        c.talks()
-        c.talks(year=2024)
-        c.talks(track="healthcare")
-        c.years()
-        c.tracks()
-        c.talk("ys__Y1mICwo")
-        assert parses == []  # every one of those was answered from the memo
-
-
-def test_changed_html_invalidates_the_memo(tmp_path: Path, site: FakeSite) -> None:
-    with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
-        assert len(c.talks(track="healthcare")) == 6
-        site.override["healthcare"] = site.html("healthcare").replace(
-            'class="talk-card"', 'class="talk-card-withdrawn"', 2
-        )
+        assert c.talk("tP_kg20VAho") is not None
+        site.override = {t: site.html(t).replace("tP_kg20VAho", "REPLACED-ID") for t in TRACKS}
         site.etag_suffix = "v2"
+        result = c.refresh()
+        assert (result.talks_added, result.talks_removed) == (1, 1)
+        assert c.talk("tP_kg20VAho") is None
+        assert c.talk("REPLACED-ID") is not None
+
+
+def test_a_talk_dropped_from_one_track_only_survives(tmp_path: Path, site: FakeSite) -> None:
+    with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
         c.refresh()
-        assert len(c.talks(track="healthcare")) == 4
-
-
-def test_a_parser_fix_applies_without_recrawling(client: ApiGrunn, site: FakeSite) -> None:
-    """The HTML is the cache, so re-parsing needs no network at all."""
-    client.refresh()
-    site.reset()
-    client._parsed.clear()  # as a new process, or a new library version, would
-    assert len(client.talks()) == 66
-    assert site.requests == []
+        assert set(c.talk("ys__Y1mICwo").tracks) == {
+            "education",
+            "government",
+            "sensible-ai",
+            "tech",
+        }
+        site.override["education"] = site.html("education").replace("ys__Y1mICwo", "OTHER-ID")
+        site.etag_suffix = "v2"
+        result = c.refresh()
+        assert result.talks_removed == 0
+        assert "education" not in c.talk("ys__Y1mICwo").tracks
 
 
 def test_one_failing_page_does_not_sink_the_refresh(tmp_path: Path, site: FakeSite) -> None:
@@ -197,6 +180,17 @@ def test_a_failed_page_is_retried_rather_than_304d(tmp_path: Path, site: FakeSit
         assert len(c.talks(track="healthcare")) == 6
 
 
+def test_a_page_failing_later_keeps_its_stored_tags(tmp_path: Path, site: FakeSite) -> None:
+    with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
+        c.refresh()
+        assert len(c.talks(track="healthcare")) == 6
+        site.fail = {"healthcare"}
+        result = c.refresh()
+        assert [p.track for p in result.errors] == ["healthcare"]
+        assert result.talks_removed == 0
+        assert len(c.talks(track="healthcare")) == 6  # stale, but not lost
+
+
 def test_total_failure_raises(tmp_path: Path, site: FakeSite) -> None:
     site.fail = set(TRACKS)
     with (
@@ -211,21 +205,23 @@ def test_unreadable_page_does_not_break_the_others(tmp_path: Path, site: FakeSit
     site.override["healthcare"] = broken
     with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
         result = c.refresh()
-        assert result.fetched == 8
-        assert next(p for p in result.pages if p.track == "healthcare").cards == 0
+        assert result.fetched == 7
+        healthcare = next(p for p in result.pages if p.track == "healthcare")
+        assert healthcare.status == "error"
+        assert "APIGRUNN-E200" in healthcare.error
         assert len(c.talks()) == 66
         assert c.talks(track="healthcare") == []
 
 
-def test_a_talk_removed_from_the_site_disappears(tmp_path: Path, site: FakeSite) -> None:
+def test_an_unreadable_page_is_retried_not_304d(tmp_path: Path, site: FakeSite) -> None:
+    site.override["healthcare"] = '<div class="talks-year-group"><a class="talk-card"></a></div>'
     with ApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
         c.refresh()
-        assert c.talk("tP_kg20VAho") is not None
-        site.override = {t: site.html(t).replace("tP_kg20VAho", "REPLACED-ID") for t in TRACKS}
-        site.etag_suffix = "v2"
-        c.refresh()
-        assert c.talk("tP_kg20VAho") is None
-        assert c.talk("REPLACED-ID") is not None
+        site.override.clear()
+        site.reset()
+        result = c.refresh()
+        assert [p.track for p in result.pages if p.status == "fetched"] == ["healthcare"]
+        assert len(c.talks(track="healthcare")) == 6
 
 
 # ------------------------------------------------------------------ async
@@ -235,13 +231,12 @@ async def test_async_client_matches_the_sync_one(tmp_path: Path, site: FakeSite)
     async with AsyncApiGrunn(db_path=tmp_path / "a.db", transport=site.transport) as c:
         result = await c.refresh()
         assert result.fetched == 8
-        assert result.talks == 66
+        assert (result.talks, result.talks_added) == (66, 66)
         assert len(await c.talks()) == 66
         assert len(await c.talks(year=2024)) == 27
         assert await c.years() == [2025, 2024, 2023]
         assert (await c.talk("ys__Y1mICwo")).title
         assert [t.slug for t in await c.tracks()] == list(TRACKS)
-        assert sorted(await c.pages()) == sorted(TRACKS)
 
 
 async def test_async_queries_auto_refresh(tmp_path: Path, site: FakeSite) -> None:
@@ -258,4 +253,4 @@ async def test_async_second_refresh_is_all_304s(tmp_path: Path, site: FakeSite) 
         await c.refresh()
         result = await c.refresh()
         assert result.not_modified == 8
-        assert result.talks == 66
+        assert (result.talks, result.talks_added, result.talks_removed) == (66, 0, 0)

@@ -67,8 +67,15 @@ class RefreshResult(BaseModel):
     """Summary of a :meth:`~apigrunn.ApiGrunn.refresh` call."""
 
     pages: list[PageResult] = Field(default_factory=list)
+
     talks: int = 0
-    """How many distinct talks the cached pages hold after this refresh."""
+    """How many distinct talks the cache holds after this refresh."""
+
+    talks_added: int = 0
+    """Talks that were not in the cache before."""
+
+    talks_removed: int = 0
+    """Talks pruned because no track page lists them any more."""
 
     @property
     def fetched(self) -> int:
@@ -85,5 +92,6 @@ class RefreshResult(BaseModel):
     def __str__(self) -> str:  # pragma: no cover - convenience only
         return (
             f"RefreshResult(fetched={self.fetched}, not_modified={self.not_modified}, "
-            f"errors={len(self.errors)}, talks={self.talks})"
+            f"errors={len(self.errors)}, talks={self.talks}, "
+            f"added={self.talks_added}, removed={self.talks_removed})"
         )
